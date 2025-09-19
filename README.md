@@ -159,18 +159,6 @@ L'application utilise :
    serve -s build
    ```
 
-## 📝 Licence
-
-Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.
-
-## 👥 Contribution
-
-Les contributions sont les bienvenues ! N'hésitez pas à ouvrir une issue ou une pull request.
-
-## 📞 Support
-
-Pour toute question ou problème, veuillez ouvrir une issue dans le dépôt.
-
 ---
 
-Développé avec ❤️ par [Votre Nom] | © 2025 Tous droits réservés
+Développé avec ❤️ par SIF-EDDINE | © 2025 Tous droits réservés

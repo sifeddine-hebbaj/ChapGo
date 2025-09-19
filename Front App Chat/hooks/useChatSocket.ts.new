@@ -1,0 +1,461 @@
+import { Client, IMessage, StompSubscription } from '@stomp/stompjs';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Platform } from 'react-native';
+import { WS_URL, BASE_URL } from '@/lib/api';
+import { getToken } from '@/lib/auth';
+import SockJS from 'sockjs-client';
+
+// Types for WebSocket payloads
+type TypingPayload = {
+  userId: string;
+  conversationId: string;
+  isTyping: boolean;
+};
+
+type ReadReceiptPayload = {
+  userId: string;
+  conversationId: string;
+  messageId: string;
+  readAt: string;
+};
+
+export interface ChatMessageDto {
+  id?: string;
+  text: string;
+  senderId: string;
+  conversationId?: string;
+  timestamp?: string;
+  status?: 'sending' | 'sent' | 'delivered' | 'read' | 'error';
+  type?: 'text' | 'image' | 'video' | 'audio' | 'document' | 'file';
+  mediaUrl?: string | null;
+  fileName?: string;
+  fileSize?: number;
+  mimeType?: string;
+}
+
+const CONNECTION_STATES = {
+  DISCONNECTED: 'disconnected',
+  CONNECTING: 'connecting',
+  CONNECTED: 'connected',
+  ERROR: 'error'
+} as const;
+
+type ConnectionState = typeof CONNECTION_STATES[keyof typeof CONNECTION_STATES];
+
+interface UseChatSocketProps {
+  onMessage: (msg: ChatMessageDto) => void;
+  onTyping?: (payload: TypingPayload) => void;
+  onRead?: (payload: ReadReceiptPayload) => void;
+  onConnectionChange?: (isConnected: boolean) => void;
+  onError?: (error: Error) => void;
+}
+
+export function useChatSocket(conversationId: string, { 
+  onMessage, 
+  onTyping, 
+  onRead, 
+  onConnectionChange,
+  onError
+}: UseChatSocketProps) {
+  const [connectionState, setConnectionState] = useState<ConnectionState>(CONNECTION_STATES.DISCONNECTED);
+  const clientRef = useRef<Client | null>(null);
+  const subscriptionsRef = useRef<StompSubscription[]>([]);
+  const reconnectAttempts = useRef(0);
+  const maxReconnectAttempts = 5;
+  const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
+  const isConnected = connectionState === CONNECTION_STATES.CONNECTED;
+  const isMounted = useRef(true);
+  
+  const pendingQueue = useRef<Array<{
+    message: ChatMessageDto;
+    resolve: () => void;
+    reject: (error: Error) => void;
+    timestamp: number;
+  }>>([]);
+
+  // Process pending messages in the queue
+  const processPendingQueue = useCallback(() => {
+    if (!isConnected || !clientRef.current?.connected) return;
+
+    const queue = [...pendingQueue.current];
+    pendingQueue.current = [];
+
+    queue.forEach(({ message, resolve, reject }) => {
+      try {
+        clientRef.current?.publish({
+          destination: `/app/chat/${conversationId}`,
+          body: JSON.stringify(message),
+          headers: { 'content-type': 'application/json' },
+        });
+        resolve();
+      } catch (error) {
+        console.error('[WS] Error sending queued message:', error);
+        pendingQueue.current.push({ message, resolve, reject, timestamp: Date.now() });
+      }
+    });
+  }, [conversationId, isConnected]);
+
+  // Set up WebSocket subscriptions
+  const setupSubscriptions = useCallback(() => {
+    if (!clientRef.current?.connected) return;
+
+    // Clear existing subscriptions
+    subscriptionsRef.current.forEach(sub => sub.unsubscribe());
+    subscriptionsRef.current = [];
+
+    // Subscribe to messages
+    const messageSubscription = clientRef.current.subscribe(
+      `/topic/chat/${conversationId}/messages`,
+      (message) => {
+        try {
+          const msg = JSON.parse(message.body);
+          onMessage(msg);
+        } catch (error) {
+          console.error('[WS] Error parsing message:', error);
+          onError?.(new Error('Failed to parse message'));
+        }
+      },
+      { id: `messages-${conversationId}` }
+    );
+    subscriptionsRef.current.push(messageSubscription);
+
+    // Subscribe to typing indicators
+    if (onTyping) {
+      const typingSubscription = clientRef.current.subscribe(
+        `/topic/chat/${conversationId}/typing`,
+        (message) => {
+          try {
+            const typingData = JSON.parse(message.body);
+            onTyping(typingData);
+          } catch (error) {
+            console.error('[WS] Error parsing typing indicator:', error);
+          }
+        },
+        { id: `typing-${conversationId}` }
+      );
+      subscriptionsRef.current.push(typingSubscription);
+    }
+
+    // Subscribe to read receipts
+    if (onRead) {
+      const readSubscription = clientRef.current.subscribe(
+        `/topic/chat/${conversationId}/read`,
+        (message) => {
+          try {
+            const readData = JSON.parse(message.body);
+            onRead(readData);
+          } catch (error) {
+            console.error('[WS] Error parsing read receipt:', error);
+          }
+        },
+        { id: `read-${conversationId}` }
+      );
+      subscriptionsRef.current.push(readSubscription);
+    }
+  }, [conversationId, onMessage, onTyping, onRead, onError]);
+
+  // Handle reconnection with exponential backoff
+  const handleReconnect = useCallback(() => {
+    if (reconnectAttempts.current >= maxReconnectAttempts) {
+      console.warn('[WS] Max reconnection attempts reached');
+      onError?.(new Error('Failed to connect to the chat server'));
+      return;
+    }
+
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts.current), 30000);
+    reconnectAttempts.current++;
+
+    console.log(`[WS] Reconnecting in ${delay}ms (attempt ${reconnectAttempts.current}/${maxReconnectAttempts})`);
+    
+    reconnectTimeout.current = setTimeout(() => {
+      if (!isMounted.current) return;
+      
+      const client = clientRef.current;
+      if (client && !client.active && !client.connected) {
+        client.activate().catch(error => {
+          console.error('[WS] Reconnection attempt failed:', error);
+          handleReconnect();
+        });
+      }
+    }, delay);
+  }, [onError]);
+
+  // Initialize WebSocket client
+  useEffect(() => {
+    isMounted.current = true;
+    
+    const config = {
+      reconnectDelay: 0, // We'll handle reconnection manually
+      heartbeatIncoming: 4000,
+      heartbeatOutgoing: 4000,
+      debug: (str: string) => {
+        if (__DEV__) {
+          console.log(`[WS] ${str}`);
+        }
+      },
+      onWebSocketClose: (event: CloseEvent) => {
+        console.log(`[WS] WebSocket closed: ${event.code} ${event.reason || 'No reason provided'}`);
+        if (isMounted.current) {
+          setConnectionState(CONNECTION_STATES.DISCONNECTED);
+          onConnectionChange?.(false);
+          handleReconnect();
+        }
+      },
+      onStompError: (frame: IMessage) => {
+        console.error('[WS] STOMP protocol error:', frame.headers?.message || 'Unknown error');
+        if (isMounted.current) {
+          setConnectionState(CONNECTION_STATES.ERROR);
+          onConnectionChange?.(false);
+          onError?.(new Error(frame.headers?.message || 'WebSocket protocol error'));
+        }
+      },
+      onDisconnect: () => {
+        console.log('[WS] Disconnected from WebSocket server');
+        if (isMounted.current) {
+          setConnectionState(CONNECTION_STATES.DISCONNECTED);
+          onConnectionChange?.(false);
+        }
+      },
+      onWebSocketError: (event: Event) => {
+        console.error('[WS] WebSocket error:', event);
+        if (isMounted.current) {
+          setConnectionState(CONNECTION_STATES.ERROR);
+          onConnectionChange?.(false);
+          onError?.(new Error('WebSocket connection error'));
+        }
+      },
+      onConnect: async (frame: IMessage) => {
+        console.log('[WS] Successfully connected to WebSocket server');
+        
+        if (isMounted.current) {
+          setConnectionState(CONNECTION_STATES.CONNECTED);
+          onConnectionChange?.(true);
+          reconnectAttempts.current = 0;
+          
+          // Set up subscriptions
+          setupSubscriptions();
+          
+          // Process any pending messages
+          processPendingQueue();
+        }
+      },
+    };
+
+    // Configure WebSocket factory based on platform
+    if (Platform.OS === 'web') {
+      console.log('[WS] Platform: Web - Using SockJS');
+      
+      config.webSocketFactory = () => {
+        try {
+          return new SockJS(`${BASE_URL}/ws`) as WebSocket;
+        } catch (error) {
+          console.error('[WS] Failed to create SockJS connection:', error);
+          throw error;
+        }
+      };
+    } else {
+      console.log('[WS] Platform: Native - Using WebSocket');
+      console.log(`[WS] WebSocket URL: ${WS_URL}`);
+      
+      config.brokerURL = WS_URL;
+      config.connectionTimeout = 5000; // 5 seconds
+    }
+
+    const client = new Client(config);
+    clientRef.current = client;
+
+    // Connect to WebSocket
+    const connectWebSocket = async () => {
+      if (client.active || client.connected) return;
+
+      try {
+        const token = await getToken();
+        if (!token) {
+          console.warn('[WS] No authentication token available');
+          onError?.(new Error('Authentication required'));
+          return;
+        }
+
+        client.connectHeaders = {
+          Authorization: `Bearer ${token}`,
+          'X-Client-Type': 'mobile-app',
+          'X-Client-Version': '1.0.0'
+        };
+
+        console.log('[WS] Connecting to WebSocket server...');
+        if (isMounted.current) {
+          setConnectionState(CONNECTION_STATES.CONNECTING);
+        }
+        
+        await client.activate();
+      } catch (error) {
+        console.error('[WS] Failed to connect to WebSocket:', error);
+        if (isMounted.current) {
+          setConnectionState(CONNECTION_STATES.ERROR);
+          onConnectionChange?.(false);
+          onError?.(error instanceof Error ? error : new Error('Failed to connect to WebSocket'));
+        }
+        handleReconnect();
+      }
+    };
+
+    connectWebSocket();
+
+    // Clean up on unmount
+    return () => {
+      isMounted.current = false;
+      
+      // Clear any pending timeouts
+      if (reconnectTimeout.current) {
+        clearTimeout(reconnectTimeout.current);
+        reconnectTimeout.current = null;
+      }
+      
+      // Unsubscribe from all subscriptions
+      subscriptionsRef.current.forEach(sub => {
+        try {
+          sub.unsubscribe();
+        } catch (error) {
+          console.error('[WS] Error unsubscribing:', error);
+        }
+      });
+      subscriptionsRef.current = [];
+      
+      // Clear pending queue
+      pendingQueue.current = [];
+      
+      // Deactivate client
+      if (clientRef.current) {
+        try {
+          if (clientRef.current.connected || clientRef.current.active) {
+            clientRef.current.deactivate();
+          }
+        } catch (error) {
+          console.error('[WS] Error deactivating client:', error);
+        }
+        clientRef.current = null;
+      }
+    };
+  }, [conversationId, onMessage, onTyping, onRead, onConnectionChange, onError, handleReconnect, processPendingQueue, setupSubscriptions]);
+
+  // Send a message through WebSocket
+  const sendMessage = useCallback(async (message: Omit<ChatMessageDto, 'id' | 'timestamp' | 'status'>) => {
+    return new Promise<void>((resolve, reject) => {
+      const messageWithMetadata: ChatMessageDto = {
+        ...message,
+        id: Date.now().toString(),
+        timestamp: new Date().toISOString(),
+        status: 'sending',
+      };
+
+      // If not connected, add to queue and try to connect
+      if (!isConnected || !clientRef.current?.connected) {
+        console.log('[WS] Not connected, queueing message');
+        pendingQueue.current.push({
+          message: messageWithMetadata,
+          resolve,
+          reject,
+          timestamp: Date.now(),
+        });
+
+        // Try to connect if not already connecting
+        if (connectionState === CONNECTION_STATES.DISCONNECTED) {
+          console.log('[WS] Attempting to connect...');
+          const client = clientRef.current;
+          if (client) {
+            client.activate().catch(error => {
+              console.error('[WS] Connection attempt failed:', error);
+              reject(new Error('Failed to connect to the server'));
+            });
+          }
+        }
+        return;
+      }
+
+      // If connected, send immediately
+      try {
+        console.log('[WS] Sending message:', messageWithMetadata);
+        clientRef.current.publish({
+          destination: `/app/chat/${conversationId}`,
+          body: JSON.stringify({
+            ...messageWithMetadata,
+            conversationId,
+          }),
+          headers: { 'content-type': 'application/json' },
+        });
+        resolve();
+      } catch (error) {
+        console.error('[WS] Error sending message:', error);
+        
+        // Add to queue and try to reconnect
+        pendingQueue.current.push({
+          message: messageWithMetadata,
+          resolve,
+          reject,
+          timestamp: Date.now(),
+        });
+        
+        // Try to reconnect if not already connected or connecting
+        if (connectionState !== CONNECTION_STATES.CONNECTED) {
+          console.log('[WS] Attempting to reconnect after send failure...');
+          const client = clientRef.current;
+          if (client) {
+            client.activate().catch(err => {
+              console.error('[WS] Reconnection failed:', err);
+              reject(new Error('Failed to send message and reconnect'));
+            });
+          }
+        } else {
+          reject(error);
+        }
+      }
+    });
+  }, [isConnected, connectionState, conversationId]);
+
+  // Send typing indicator
+  const sendTypingIndicator = useCallback((isTyping: boolean) => {
+    if (!isConnected || !clientRef.current?.connected) return;
+    
+    try {
+      clientRef.current.publish({
+        destination: `/app/chat/${conversationId}/typing`,
+        body: JSON.stringify({
+          conversationId,
+          isTyping,
+          timestamp: new Date().toISOString(),
+        }),
+        headers: { 'content-type': 'application/json' },
+      });
+    } catch (error) {
+      console.error('[WS] Error sending typing indicator:', error);
+    }
+  }, [conversationId, isConnected]);
+
+  // Send read receipt
+  const sendReadReceipt = useCallback((messageId: string) => {
+    if (!isConnected || !clientRef.current?.connected) return;
+    
+    try {
+      clientRef.current.publish({
+        destination: `/app/chat/${conversationId}/read`,
+        body: JSON.stringify({
+          conversationId,
+          messageId,
+          readAt: new Date().toISOString(),
+        }),
+        headers: { 'content-type': 'application/json' },
+      });
+    } catch (error) {
+      console.error('[WS] Error sending read receipt:', error);
+    }
+  }, [conversationId, isConnected]);
+
+  // Return the public API
+  return {
+    sendMessage,
+    sendTypingIndicator,
+    sendReadReceipt,
+    isConnected,
+    connectionState,
+  };
+}

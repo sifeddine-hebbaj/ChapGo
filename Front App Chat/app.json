@@ -1,0 +1,60 @@
+{
+  "expo": {
+    "name": "ChapGo",
+    "slug": "ChapGo",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/application.png",
+    "scheme": "myapp",
+    "userInterfaceStyle": "automatic",
+    "jsEngine": "hermes",
+    "newArchEnabled": true,
+    "experiments": {
+      "tsconfigPaths": true,
+      "typedRoutes": true
+    },
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Cette application utilise la caméra pour les appels vidéo.",
+        "NSMicrophoneUsageDescription": "Cette application utilise le microphone pour les appels audio/vidéo."
+      }
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/images/chat.png"
+    },
+    "extra": {
+      "router": {
+        "origin": false
+      },
+      "eas": {
+        "projectId": ""
+      }
+    },
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      "expo-web-browser",
+      "expo-secure-store",
+      "expo-image-picker",
+      "expo-document-picker",
+      "expo-location",
+      "expo-av",
+      "expo-camera",
+      "expo-video"
+    ],
+    "permissions": [
+      "android.permission.CAMERA",
+      "android.permission.RECORD_AUDIO",
+      "android.permission.ACCESS_FINE_LOCATION",
+      "android.permission.ACCESS_COARSE_LOCATION",
+      "android.permission.READ_EXTERNAL_STORAGE",
+      "android.permission.WRITE_EXTERNAL_STORAGE"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
